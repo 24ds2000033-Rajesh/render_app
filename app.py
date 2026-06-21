@@ -1,49 +1,101 @@
-import json
-import os
-from openai import OpenAI
+import re
+import sys
+import traceback
+from io import StringIO
+from typing import List
 
-client = OpenAI(
-    api_key=os.environ["AIPIPE_TOKEN"],
-    base_url="https://aipipe.org/openai/v1"
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI()
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-def analyze_error_with_ai(code: str, tb: str):
 
-    prompt = f"""
-Analyze the Python code and traceback.
+class CodeRequest(BaseModel):
+    code: str
 
-CODE:
-{code}
 
-TRACEBACK:
-{tb}
+class CodeResponse(BaseModel):
+    error: List[int]
+    result: str
 
-Return JSON only:
 
-{{
-  "error_lines": [line_numbers]
-}}
-"""
+def execute_python_code(code: str):
+    """
+    Execute Python code and return exact output.
+    """
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": "Return valid JSON only."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0
-    )
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
 
-    content = response.choices[0].message.content
+    stdout_buffer = StringIO()
+    stderr_buffer = StringIO()
+
+    sys.stdout = stdout_buffer
+    sys.stderr = stderr_buffer
 
     try:
-        data = json.loads(content)
-        return data.get("error_lines", [])
+        exec(code, {})
+
+        return {
+            "success": True,
+            "output": stdout_buffer.getvalue()
+        }
+
     except Exception:
-        return []
+        return {
+            "success": False,
+            "output": traceback.format_exc()
+        }
+
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+
+def analyze_error(traceback_text: str):
+    """
+    Extract line numbers from traceback.
+    """
+
+    matches = re.findall(r'line (\d+)', traceback_text)
+
+    lines = []
+    for m in matches:
+        try:
+            lines.append(int(m))
+        except Exception:
+            pass
+
+    return sorted(list(set(lines)))
+
+
+@app.get("/")
+def root():
+    return {"status": "running"}
+
+
+@app.post("/code-interpreter", response_model=CodeResponse)
+def code_interpreter(req: CodeRequest):
+
+    execution = execute_python_code(req.code)
+
+    if execution["success"]:
+        return {
+            "error": [],
+            "result": execution["output"]
+        }
+
+    return {
+        "error": analyze_error(execution["output"]),
+        "result": execution["output"]
+    }
